@@ -6,6 +6,7 @@ from typing import Callable, List
 
 import torch
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 import transformers
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
@@ -305,23 +306,30 @@ class AcceleratePPOTrainer(AccelerateRLTrainer):
                 all_str_samples, all_str_prompts, all_str_outputs = self.decode(
                     gathered_prompts, gathered_samples, gathered_prompt_sizes, append_eos_token=True
                 )
+                # Remove padding from input to reward_fn
+                EOS_WORD = self.tokenizer.decode(self.tokenizer.eos_token_id)
+                all_str_samples = [sample.replace(EOS_WORD, "") for sample in all_str_samples]
+                all_str_prompts = [sample.replace(EOS_WORD, "") for sample in all_str_prompts]
+                all_str_outputs = [sample.replace(EOS_WORD, "") for sample in all_str_outputs]
 
                 rollout_score_time = time()
-                all_scores = torch.tensor(
-                    self.reward_fn(
-                        samples=all_str_samples, prompts=all_str_prompts, outputs=all_str_outputs, **metadata
-                    ),
-                    dtype=torch.float,
-                    device=device,
-                )
+                # reward_fn should return list of rewards at each token per sample
+                all_scores = self.reward_fn(samples=all_str_samples, prompts=all_str_prompts, outputs=all_str_outputs, model_tok=self.tokenizer, **metadata)
+                all_scores = [torch.tensor(score, dtype=torch.float, device=device).view(-1,) for score in all_scores]
+                # Pad 0 reward on the ends
+                all_scores = pad_sequence(all_scores, batch_first=True, padding_value=-1)
+                max_len = torch.tensor(all_scores.shape[1], dtype=torch.long, device=device)
+
                 stats["time/rollout_score"] = time() - rollout_score_time
 
-                all_scores = list(all_scores.reshape(self.accelerator.num_processes, -1).unbind())
+                all_scores = list(all_scores.reshape(self.accelerator.num_processes, -1, max_len).unbind())
             else:
                 all_scores = None
+                max_len = torch.tensor(0, dtype=torch.long, device=device)
 
             if torch.distributed.is_initialized():
-                scores = torch.empty(len(samples), device=device)
+                torch.distributed.broadcast(max_len, 0)
+                scores = torch.empty((len(samples), max_len), device=device)
                 torch.distributed.scatter(scores, all_scores)
             else:
                 scores = all_scores[0].clone().detach()
@@ -352,7 +360,7 @@ class AcceleratePPOTrainer(AccelerateRLTrainer):
 
             # store statistics of the initial rollout as reference
             if self.ref_mean is None:
-                self.ref_mean, self.ref_std = scores.mean(), scores.std()
+                self.ref_mean, self.ref_std = scores.sum(dim=1).mean(), scores.sum(dim=1).std()
             all_scores_mean, all_scores_std = self.running_moments.update(scores)
             stats["rollout_scores/mean"] = all_scores_mean.item()
             stats["rollout_scores/std"] = all_scores_std.item()
@@ -437,6 +445,7 @@ class AcceleratePPOTrainer(AccelerateRLTrainer):
                 start = 0
             else:
                 start = prompt_tensors.shape[1] - 1
+                len_prompts = torch.sum(prompt_tensors.not_equal(self.tokenizer.pad_token_id), dim=1)
 
             log_ratio = (logprobs - ref_logprobs) * attention_mask[:, :-1]
             kl = log_ratio.exp() - 1 - log_ratio
@@ -462,8 +471,24 @@ class AcceleratePPOTrainer(AccelerateRLTrainer):
             rollout_count = 0
 
             for sample_idx in range(n_samples):
+                # To compute per token reward first add in kl penalties over trajectory
                 rewards = kl_penalty[sample_idx]
-                rewards[-1] += scores[sample_idx].cpu()
+                # Then add in rewards
+                if scores.shape[1] == 1:
+                    rewards[-1] += scores[sample_idx][0].cpu()
+                else:
+                    # TODO(dahoas): check for no off by one errors. Note scores are computed without any left or right padding
+                    # Only want to return scores for the responses
+                    # Strictly speaking this is incorrect as the prompt may be tokenized different with vs. without the response
+                    score = scores[sample_idx][len_prompts[sample_idx]:].cpu()
+                    score_right_padding = torch.sum(score != -1)
+                    score = score[:score_right_padding]
+                    try:
+                        rewards += score
+                    except:
+                        print(self.tokenizer.decode(all_tokens[sample_idx][start : ends[sample_idx]]))
+                        #print()
+                        exit()
 
                 ppo_rl_elements.append(
                     PPORLElement(
